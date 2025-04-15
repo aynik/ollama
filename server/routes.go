@@ -160,7 +160,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	// expire the runner
 	if req.Prompt == "" && req.KeepAlive != nil && int(req.KeepAlive.Seconds()) == 0 {
-		s.sched.expireRunner(m)
+		s.sched.expireRunner(m, false)
 
 		c.JSON(http.StatusOK, api.GenerateResponse{
 			Model:      req.Model,
@@ -1434,6 +1434,42 @@ func (s *Server) PsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
 }
 
+func (s *Server) handleDynamicContext(ctx context.Context, currentRunner llm.LlamaServer, currentModel *Model, currentOpts *api.Options, tokenCount int, numPredict int, req *api.ChatRequest, caps []model.Capability, checkpointStart time.Time) (llm.LlamaServer, *Model, *api.Options, time.Time) {
+	if tokenCount+numPredict <= currentOpts.NumCtx {
+		slog.Info("Dynamic Context: Current context sufficient", "current_ctx", currentOpts.NumCtx, "tokenCount", tokenCount, "numPredict", numPredict)
+		return currentRunner, currentModel, currentOpts, checkpointStart
+	}
+
+	targetCtx := int(math.Ceil(float64(tokenCount+numPredict)/float64(envconfig.ContextExpandLength()))) * int(envconfig.ContextExpandLength())
+	if targetCtx < api.DefaultOptions().NumCtx {
+		targetCtx = api.DefaultOptions().NumCtx
+	}
+	slog.Info("Dynamic Context: Increasing context required", "current_ctx", currentOpts.NumCtx, "target_ctx", targetCtx)
+
+	unloadCh := s.sched.expireRunner(currentModel, true)
+	select {
+	case <-unloadCh:
+		slog.Info("Dynamic Context: Old runner unloaded successfully")
+	case <-time.After(10 * time.Second):
+		slog.Error("Dynamic Context: Timeout waiting for old runner to unload")
+		return currentRunner, currentModel, currentOpts, checkpointStart
+	case <-ctx.Done():
+		slog.Error("Dynamic Context: Request cancelled during unload")
+		return currentRunner, currentModel, currentOpts, checkpointStart
+	}
+
+	currentOpts.NumCtx = targetCtx
+	req.Options["num_ctx"] = int64(targetCtx)
+
+	newRunner, newModel, newOpts, err := s.scheduleRunner(ctx, currentModel.Name, caps, req.Options, req.KeepAlive)
+	if err != nil {
+		slog.Error("Dynamic Context: Reload failed", "error", err, "target_ctx", targetCtx)
+		return currentRunner, currentModel, currentOpts, checkpointStart
+	}
+
+	return newRunner, newModel, newOpts, time.Now()
+}
+
 func (s *Server) ChatHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 
@@ -1460,7 +1496,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 			return
 		}
-		s.sched.expireRunner(model)
+		s.sched.expireRunner(model, false)
 
 		c.JSON(http.StatusOK, api.ChatResponse{
 			Model:      req.Model,
@@ -1470,6 +1506,55 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			DoneReason: "unload",
 		})
 		return
+	}
+
+	dynamicCtxEnabled := false
+	requestedNumCtx := 0
+	if requestedNumCtxVal, specified := req.Options["num_ctx"]; specified {
+		if numCtxFloat, ok := requestedNumCtxVal.(float64); ok && numCtxFloat == 0.0 {
+			dynamicCtxEnabled = true
+			delete(req.Options, "num_ctx")
+		} else if numCtxInt, ok := requestedNumCtxVal.(float64); ok {
+			requestedNumCtx = int(numCtxInt)
+		}
+	}
+	requestedNumPredict := 0
+	if requestedNumPredictVal, specified := req.Options["num_predict"]; specified {
+		if numPredictFloat, ok := requestedNumPredictVal.(float64); ok && numPredictFloat != 0.0 {
+			requestedNumPredict = int(numPredictFloat)
+		}
+	}
+	slog.Info("Dynamic Context", "dynamicCtxEnabled", dynamicCtxEnabled, "requestedNumCtx", requestedNumCtx, "requestedNumPredict", requestedNumPredict)
+
+	if dynamicCtxEnabled {
+		parsedName := model.ParseName(req.Model)
+		modelPath := ""
+		if m, err := GetModel(parsedName.String()); err == nil {
+			modelPath = m.ModelPath
+		} else {
+			slog.Debug("ChatHandler: Model not found initially, will proceed with defaults", "model", req.Model, "error", err)
+		}
+
+		if modelPath != "" {
+			s.sched.loadedMu.Lock()
+			existingRunner, ok := s.sched.loaded[modelPath]
+			if ok && existingRunner != nil && existingRunner.Options != nil {
+				currentRunnerCtx := existingRunner.Options.NumCtx
+				if currentRunnerCtx > 0 {
+					slog.Info("ChatHandler: Found existing runner, setting initial req.Options[num_ctx]", "model", req.Model, "num_ctx", currentRunnerCtx)
+					if req.Options == nil {
+						req.Options = make(map[string]interface{})
+					}
+					req.Options["num_ctx"] = float64(currentRunnerCtx)
+				} else {
+					slog.Warn("ChatHandler: Existing runner found but context size is zero or invalid", "model", req.Model, "num_ctx", currentRunnerCtx)
+				}
+
+			} else {
+				slog.Info("ChatHandler: No existing runner found for model, will use defaults.", "model", req.Model)
+			}
+			s.sched.loadedMu.Unlock()
+		}
 	}
 
 	caps := []model.Capability{model.CapabilityCompletion}
@@ -1516,11 +1601,23 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 	msgs = filterThinkTags(msgs, m)
 
-	prompt, images, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, req.Tools)
+	prompt, images, tokenCount, err := chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, req.Tools, !dynamicCtxEnabled)
 	if err != nil {
 		slog.Error("chat prompt error", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	if dynamicCtxEnabled {
+		r, m, opts, checkpointLoaded = s.handleDynamicContext(
+			c.Request.Context(),
+			r, m, opts,
+			tokenCount,
+			requestedNumPredict,
+			&req,
+			caps,
+			checkpointLoaded,
+		)
 	}
 
 	slog.Debug("chat request", "images", len(images), "prompt", prompt)

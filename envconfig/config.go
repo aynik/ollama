@@ -169,7 +169,9 @@ var (
 	// Enable the new Ollama engine
 	NewEngine = Bool("OLLAMA_NEW_ENGINE")
 	// ContextLength sets the default context length
-	ContextLength = Uint("OLLAMA_CONTEXT_LENGTH", 4096)
+	ContextLength = Uint("OLLAMA_CONTEXT_LENGTH", 8192)
+	// ContextExpandLength sets the default context expansion length
+	ContextExpandLength = Uint("OLLAMA_CONTEXT_EXPAND_LENGTH", 8192)
 )
 
 func String(s string) func() string {

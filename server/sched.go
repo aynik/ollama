@@ -329,7 +329,9 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				continue
 			}
 			runner.refMu.Lock()
-			runner.refCount--
+			if runner.refCount > 0 {
+				runner.refCount--
+			}
 			if runner.refCount <= 0 {
 				if runner.sessionDuration <= 0 {
 					slog.Debug("runner with zero duration has gone idle, expiring to unload", "runner", runner)
@@ -360,27 +362,23 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
 			runner.refMu.Unlock()
 		case runner := <-s.expiredCh:
-			slog.Debug("runner expired event received", "runner", runner)
+			slog.Debug("runner expired event received", "modelPath", runner.modelPath, "refCount", runner.refCount)
 			runner.refMu.Lock()
 			if runner.refCount > 0 {
-				slog.Debug("expired event with positive ref count, retrying", "runner", runner, "refCount", runner.refCount)
-				go func(runner *runnerRef) {
-					// We can't unload yet, but want to as soon as the current request completes
-					// So queue up another expired event
-					time.Sleep(10 * time.Millisecond)
-					s.expiredCh <- runner
-				}(runner)
-				runner.refMu.Unlock()
-				continue
+				slog.Warn("forcing unload despite positive ref count", "modelPath", runner.modelPath, "refCount", runner.refCount)
+				runner.refCount = 0
 			}
-
 			s.loadedMu.Lock()
 			slog.Debug("got lock to unload", "runner", runner)
 			finished := runner.waitForVRAMRecovery()
 			runner.unload()
 			delete(s.loaded, runner.modelPath)
 			s.loadedMu.Unlock()
-			slog.Debug("runner released", "runner", runner)
+			slog.Debug("runner released", "modelPath", runner.modelPath)
+			if runner.unloadCh != nil {
+				close(runner.unloadCh)
+				runner.unloadCh = nil
+			}
 			runner.refMu.Unlock()
 
 			<-finished
@@ -546,7 +544,7 @@ func (s *Scheduler) filterGPUsWithoutLoadingModels(allGpus discover.GpuInfoList)
 // TODO consolidate sched_types.go
 type runnerRef struct {
 	refMu    sync.Mutex
-	refCount uint // prevent unloading if > 0
+	refCount int64 // prevent unloading if > 0
 
 	llama          llm.LlamaServer
 	pid            int
@@ -558,6 +556,8 @@ type runnerRef struct {
 	sessionDuration time.Duration
 	expireTimer     *time.Timer
 	expiresAt       time.Time
+
+	unloadCh chan struct{}
 
 	model       *Model
 	modelPath   string
@@ -843,23 +843,25 @@ func (s *Scheduler) unloadAllRunners() {
 	}
 }
 
-func (s *Scheduler) expireRunner(model *Model) {
+func (s *Scheduler) expireRunner(model *Model, force bool) chan struct{} {
+	unloadCh := make(chan struct{}, 1)
 	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
 	runner, ok := s.loaded[model.ModelPath]
-	s.loadedMu.Unlock()
-	if ok {
-		runner.refMu.Lock()
-		runner.expiresAt = time.Now()
-		if runner.expireTimer != nil {
-			runner.expireTimer.Stop()
-			runner.expireTimer = nil
-		}
-		runner.sessionDuration = 0
-		if runner.refCount <= 0 {
-			s.expiredCh <- runner
-		}
-		runner.refMu.Unlock()
+	if !ok || runner == nil {
+		close(unloadCh)
+		return unloadCh
 	}
+	runner.refMu.Lock()
+	defer runner.refMu.Unlock()
+	if force || runner.refCount <= 0 {
+		runner.sessionDuration = 0
+		runner.unloadCh = unloadCh
+		s.expiredCh <- runner
+	} else {
+		close(unloadCh)
+	}
+	return unloadCh
 }
 
 // If other runners are loaded, make sure the pending request will fit in system memory
